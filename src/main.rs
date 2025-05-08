@@ -2,6 +2,7 @@ use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use hyper::{Request, Uri};
 use http_body_util::{BodyExt, Empty};
+use html_parser::{Dom, Node};
 use std::error::Error;
 
 #[tokio::main]
@@ -19,12 +20,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Send the request and get the response
     let res = client.request(req).await?;
     
-    // Get the response body
+    // Get the response body and convert to string
     let body = res.collect().await?.to_bytes();
-
-    // Convert the body to a string and print it
     let content = String::from_utf8(body.to_vec())?;
-    println!("Response from example.com:\n{}", content);
+    
+    // Parse the HTML content
+    let dom = Dom::parse(&content)?;
+    
+    // Extract all URLs using iterator
+    let iter = dom.children.get(0).unwrap().into_iter();
+    let hrefs = iter.filter_map(|item| match item {
+        Node::Element(ref element) if element.name == "a" => {
+            element.attributes.get("href").and_then(|h| h.clone())
+        }
+        _ => None,
+    });
+
+    // Print all found URLs
+    println!("Found URLs:");
+    for (index, href) in hrefs.enumerate() {
+        println!("{}: {}", index + 1, href);
+    }
 
     Ok(())
 }
