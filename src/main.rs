@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use scraper::{Html, Selector};
 use hyper_tls::HttpsConnector;
+use url::Url;
 
 mod page;
 
@@ -54,6 +55,22 @@ fn parse_links(html: &str) -> Vec<String> {
         .filter(|href| href.starts_with("http"))
         .map(String::from)
         .collect()
+}
+
+fn make_absolute_url(base: &str, href: &str) -> Option<String> {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        Some(href.to_string())
+    } else if href.starts_with("//") {
+        Some(format!("https:{}", href))
+    } else if href.starts_with('/') {
+        let base_url = Url::parse(base).ok()?;
+        let scheme = base_url.scheme();
+        let host = base_url.host_str()?;
+        Some(format!("{}://{}{}", scheme, host, href))
+    } else {
+        let base_url = Url::parse(base).ok()?;
+        base_url.join(href).ok().map(|u| u.to_string())
+    }
 }
 
 async fn crawl_url(url: String, client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>) -> Result<Page, Box<dyn Error + Send + Sync>> {
@@ -147,9 +164,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     &page
                                 );
 
+
                                 // Send new links to be crawled
                                 for link in page.hrefs {
-                                    tx.send(link).await.ok();
+                                    let link = make_absolute_url(&url, &link);
+                                    if let Some(link) = link {
+                                        tx.send(link).await.ok();
+                                    }
                                 }
                             }
                             Err(e) => println!("Error crawling {}: {}", url, e),
