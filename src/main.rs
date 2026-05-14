@@ -14,6 +14,8 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::task::JoinSet;
+use tokio::time::{timeout, Duration};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -174,31 +176,113 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let visited = Arc::new(Mutex::new(HashSet::new()));
             let semaphore = Arc::new(Semaphore::new(concurrency));
             let index = Arc::new(Mutex::new(Index::<usize>::new(2)));
-            let mut page_count = 0;
+            let mut crawled_pages = 0;
+            let mut scheduled_pages = 0;
+            let mut workers = JoinSet::new();
+            let mut accepting_urls = true;
+            let mut shutdown_requested = false;
+            let ctrl_c = tokio::signal::ctrl_c();
+            tokio::pin!(ctrl_c);
 
             // Send the initial URL
             tx.send(url.clone()).await?;
 
             // Process URLs
-            while let Some(url) = rx.recv().await {
-                let tx = tx.clone();
-                let visited = visited.clone();
-                let semaphore = semaphore.clone();
-                let client = client.clone();
-                let index = index.clone();
-
-                if !is_visited(&url, &visited).await {
-                    let permit = semaphore.acquire_owned().await?;
-
-                    tokio::spawn(async move {
-                        crawl_worker(url, client, tx, index, page_count).await;
-                        drop(permit);
-                    });
+            loop {
+                if accepting_urls && workers.is_empty() && rx.is_empty() {
+                    break;
                 }
-                page_count += 1;
+
+                tokio::select! {
+                    signal = &mut ctrl_c, if accepting_urls => {
+                        if let Err(e) = signal {
+                            tracing::error!("Failed to listen for Ctrl-C: {}", e);
+                        }
+                        tracing::info!("Received Ctrl-C, shutting down gracefully...");
+                        shutdown_requested = true;
+                        rx.close();
+
+                        let drain_result = timeout(Duration::from_secs(5), async {
+                            while let Some(result) = workers.join_next().await {
+                                if let Ok(true) = result {
+                                    crawled_pages += 1;
+                                }
+                            }
+                        }).await;
+
+                        if drain_result.is_err() {
+                            tracing::warn!("Timed out waiting for in-flight crawls; aborting remaining work.");
+                            workers.abort_all();
+                            while workers.join_next().await.is_some() {}
+                        }
+
+                        break;
+                    }
+                    maybe_url = rx.recv(), if accepting_urls => {
+                        match maybe_url {
+                            Some(url) => {
+                                let tx = tx.clone();
+                                let visited = visited.clone();
+                                let semaphore = semaphore.clone();
+                                let client = client.clone();
+                                let index = index.clone();
+
+                                if !is_visited(&url, &visited).await {
+                                    let permit = semaphore.acquire_owned().await?;
+                                    let document_id = scheduled_pages;
+                                    scheduled_pages += 1;
+
+                                    workers.spawn(async move {
+                                        let _permit = permit;
+                                        match crawl_url(url.clone(), client).await {
+                                            Ok(page) => {
+                                                tracing::info!(url = %url, links = page.hrefs.len(), "crawled page");
+
+                                                // Add page to search index
+                                                let mut index = index.lock().await;
+                                                index.add_document(
+                                                    &[extract_title, extract_content],
+                                                    tokenizer,
+                                                    document_id,
+                                                    &page
+                                                );
+                                                drop(index);
+
+                                                // Send new links to be crawled
+                                                for link in page.hrefs {
+                                                    let link = make_absolute_url(&url, &link);
+                                                    if let Some(link) = link {
+                                                        tx.send(link).await.ok();
+                                                    }
+                                                }
+                                                true
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(url = %url, error = %e, "failed to crawl page");
+                                                false
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            None => accepting_urls = false,
+                        }
+                    }
+                    result = workers.join_next(), if !workers.is_empty() => {
+                        if let Some(Ok(true)) = result {
+                            crawled_pages += 1;
+                        }
+                    }
+                }
             }
 
-            println!("Crawling completed. Indexed {} pages.", page_count);
+            if shutdown_requested {
+                println!(
+                    "Shutdown summary: crawled {} pages before shutdown.",
+                    crawled_pages
+                );
+            }
+            println!("Crawling completed. Indexed {} pages.", crawled_pages);
         }
         Some(("search", sub_matches)) => {
             let query = sub_matches.get_one::<String>("query").unwrap();
