@@ -1,19 +1,20 @@
-use std::borrow::Cow;
+use bytes::Bytes;
+use clap::{Arg, Command};
+use http_body_util::{BodyExt, Empty};
+use hyper::{Request, Uri};
+use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
-use hyper::{Request, Uri};
-use http_body_util::{BodyExt, Empty};
-use std::error::Error;
-use bytes::Bytes;
-use probly_search::Index;
-use probly_search::score::bm25;
 use page::Page;
-use clap::{Command, Arg};
-use tokio::sync::{mpsc, Semaphore, Mutex};
-use std::collections::HashSet;
-use std::sync::Arc;
+use probly_search::score::bm25;
+use probly_search::Index;
 use scraper::{Html, Selector};
-use hyper_tls::HttpsConnector;
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::error::Error;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tracing_subscriber::EnvFilter;
 use url::Url;
 
 mod page;
@@ -48,7 +49,7 @@ async fn is_visited(url: &str, visited: &Arc<Mutex<HashSet<String>>>) -> bool {
 fn parse_links(html: &str) -> Vec<String> {
     let document = Html::parse_document(html);
     let selector = Selector::parse("a[href]").unwrap();
-    
+
     document
         .select(&selector)
         .filter_map(|element| element.value().attr("href"))
@@ -73,14 +74,53 @@ fn make_absolute_url(base: &str, href: &str) -> Option<String> {
     }
 }
 
-async fn crawl_url(url: String, client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>) -> Result<Page, Box<dyn Error + Send + Sync>> {
+#[tracing::instrument(skip(client))]
+async fn crawl_url(
+    url: String,
+    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
+) -> Result<Page, Box<dyn Error + Send + Sync>> {
     let uri = url.parse::<Uri>()?;
     let html = fetch_page(client, uri).await?;
     Ok(Page::new(html))
 }
 
+#[tracing::instrument(skip(client, tx, index))]
+async fn crawl_worker(
+    url: String,
+    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
+    tx: mpsc::Sender<String>,
+    index: Arc<Mutex<Index<usize>>>,
+    page_id: usize,
+) {
+    match crawl_url(url.clone(), client).await {
+        Ok(page) => {
+            tracing::info!(url = %url, links = page.hrefs.len(), "crawled page");
+
+            let mut index = index.lock().await;
+            index.add_document(&[extract_title, extract_content], tokenizer, page_id, &page);
+            drop(index);
+
+            for link in page.hrefs {
+                if let Some(link) = make_absolute_url(&url, &link) {
+                    tracing::debug!(url = %url, link = %link, "queueing discovered link");
+                    if tx.send(link).await.is_err() {
+                        tracing::warn!(url = %url, "failed to queue discovered link because crawler channel is closed");
+                    }
+                }
+            }
+        }
+        Err(error) => tracing::error!(url = %url, error = %error, "failed to crawl page"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     let matches = Command::new("rseek")
         .version("1.0")
         .about("Web crawler and search tool")
@@ -93,15 +133,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Arg::new("url")
                         .help("The seed URL to crawl")
                         .required(true)
-                        .index(1)
+                        .index(1),
                 )
                 .arg(
                     Arg::new("concurrency")
                         .help("Number of concurrent requests")
                         .short('c')
                         .long("concurrency")
-                        .default_value("10")
-                )
+                        .default_value("10"),
+                ),
         )
         .subcommand(
             Command::new("search")
@@ -110,23 +150,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Arg::new("query")
                         .help("The search query")
                         .required(true)
-                        .index(1)
-                )
+                        .index(1),
+                ),
         )
         .get_matches();
 
     match matches.subcommand() {
         Some(("crawl", sub_matches)) => {
             let url = sub_matches.get_one::<String>("url").unwrap();
-            let concurrency = sub_matches.get_one::<String>("concurrency")
+            let concurrency = sub_matches
+                .get_one::<String>("concurrency")
                 .unwrap()
                 .parse::<usize>()
                 .unwrap_or(10);
 
             // Create a new HTTP client with HTTPS support
             let https = HttpsConnector::new();
-            let client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>> = Client::builder(TokioExecutor::new())
-                .build(https);
+            let client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>> =
+                Client::builder(TokioExecutor::new()).build(https);
 
             // Setup crawling infrastructure
             let (tx, mut rx) = mpsc::channel(100);
@@ -150,31 +191,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let permit = semaphore.acquire_owned().await?;
 
                     tokio::spawn(async move {
-                        match crawl_url(url.clone(), client).await {
-                            Ok(page) => {
-                                println!("Crawled: {}", url);
-                                println!("Found {} links", page.hrefs.len());
-                                
-                                // Add page to search index
-                                let mut index = index.lock().await;
-                                index.add_document(
-                                    &[extract_title, extract_content],
-                                    tokenizer,
-                                    page_count,
-                                    &page
-                                );
-
-
-                                // Send new links to be crawled
-                                for link in page.hrefs {
-                                    let link = make_absolute_url(&url, &link);
-                                    if let Some(link) = link {
-                                        tx.send(link).await.ok();
-                                    }
-                                }
-                            }
-                            Err(e) => println!("Error crawling {}: {}", url, e),
-                        }
+                        crawl_worker(url, client, tx, index, page_count).await;
                         drop(permit);
                     });
                 }
@@ -185,36 +202,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(("search", sub_matches)) => {
             let query = sub_matches.get_one::<String>("query").unwrap();
-            
+
             // TODO: Load the index
             let index = Index::<usize>::new(2);
-            
+
             // Search through the index
-            let result = index.query(
-                query,
-                &mut bm25::new(),
-                tokenizer,
-                &[1., 1.],
-            );
+            let result = index.query(query, &mut bm25::new(), tokenizer, &[1., 1.]);
             println!("Search results:");
             for (i, res) in result.iter().enumerate() {
                 println!("{}. Score: {}", i + 1, res.score);
             }
         }
-        _ => unreachable!()
+        _ => unreachable!(),
     }
 
     Ok(())
 }
 
-async fn fetch_page(client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>, uri: Uri) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let req = Request::builder()
-        .uri(uri)
-        .body(Empty::new())?;
+#[tracing::instrument(skip(client))]
+async fn fetch_page(
+    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
+    uri: Uri,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    tracing::debug!(%uri, "fetching page");
+    let req = Request::builder().uri(uri).body(Empty::new())?;
 
     // Send the request and get the response
     let res = client.request(req).await?;
-    
+
     // Get the response body and convert to string
     let body = res.collect().await?.to_bytes();
     let content = String::from_utf8(body.to_vec())?;
