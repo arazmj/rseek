@@ -12,7 +12,10 @@ use scraper::{Html, Selector};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -44,6 +47,15 @@ async fn is_visited(url: &str, visited: &Arc<Mutex<HashSet<String>>>) -> bool {
         visited.insert(url.to_string());
         false
     }
+}
+
+struct CrawlItem {
+    url: String,
+    tx: mpsc::Sender<CrawlItem>,
+}
+
+fn should_enqueue_links(indexed_pages: usize, max_pages: usize) -> bool {
+    indexed_pages < max_pages
 }
 
 fn parse_links(html: &str) -> Vec<String> {
@@ -141,7 +153,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .short('c')
                         .long("concurrency")
                         .default_value("10"),
-                ),
+                )
+                .arg(
+                    Arg::new("max-pages")
+                        .help("Maximum number of pages to index")
+                        .short('m')
+                        .long("max-pages")
+                        .default_value("100")
+                )
         )
         .subcommand(
             Command::new("search")
@@ -163,6 +182,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap()
                 .parse::<usize>()
                 .unwrap_or(10);
+            let max_pages = sub_matches.get_one::<String>("max-pages")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap_or(100);
 
             // Create a new HTTP client with HTTPS support
             let https = HttpsConnector::new();
@@ -170,35 +193,83 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Client::builder(TokioExecutor::new()).build(https);
 
             // Setup crawling infrastructure
-            let (tx, mut rx) = mpsc::channel(100);
+            let (tx, mut rx) = mpsc::channel::<CrawlItem>(100);
             let visited = Arc::new(Mutex::new(HashSet::new()));
             let semaphore = Arc::new(Semaphore::new(concurrency));
             let index = Arc::new(Mutex::new(Index::<usize>::new(2)));
-            let mut page_count = 0;
+            let page_count = Arc::new(AtomicUsize::new(0));
 
-            // Send the initial URL
-            tx.send(url.clone()).await?;
+            // Send the initial URL, then drop the original sender so the receiver can close.
+            tx.send(CrawlItem { url: url.clone(), tx: tx.clone() }).await?;
+            drop(tx);
 
             // Process URLs
-            while let Some(url) = rx.recv().await {
-                let tx = tx.clone();
+            while let Some(CrawlItem { url, tx }) = rx.recv().await {
                 let visited = visited.clone();
                 let semaphore = semaphore.clone();
                 let client = client.clone();
                 let index = index.clone();
+                let page_count = page_count.clone();
 
-                if !is_visited(&url, &visited).await {
-                    let permit = semaphore.acquire_owned().await?;
+                tokio::spawn(async move {
+                    if !should_enqueue_links(page_count.load(Ordering::SeqCst), max_pages) {
+                        return;
+                    }
 
-                    tokio::spawn(async move {
-                        crawl_worker(url, client, tx, index, page_count).await;
-                        drop(permit);
-                    });
-                }
-                page_count += 1;
+                    if is_visited(&url, &visited).await {
+                        return;
+                    }
+
+                    let Ok(permit) = semaphore.acquire_owned().await else {
+                        return;
+                    };
+
+                    match crawl_url(url.clone(), client).await {
+                        Ok(page) => {
+                            tracing::info!(url = %url, links = page.hrefs.len(), "crawled page");
+
+                            let indexed_pages = {
+                                let mut index = index.lock().await;
+                                let doc_id = page_count.load(Ordering::SeqCst);
+
+                                if !should_enqueue_links(doc_id, max_pages) {
+                                    return;
+                                }
+
+                                index.add_document(
+                                    &[extract_title, extract_content],
+                                    tokenizer,
+                                    doc_id,
+                                    &page
+                                );
+
+                                let previous = page_count.fetch_add(1, Ordering::SeqCst);
+                                debug_assert_eq!(previous, doc_id);
+                                previous + 1
+                            };
+
+                            if !should_enqueue_links(indexed_pages, max_pages) {
+                                return;
+                            }
+
+                            for link in page.hrefs {
+                                let link = make_absolute_url(&url, &link);
+                                if let Some(link) = link {
+                                    tx.send(CrawlItem { url: link, tx: tx.clone() }).await.ok();
+                                }
+                            }
+                        }
+                        Err(e) => tracing::error!(url = %url, error = %e, "error crawling"),
+                    }
+
+                    drop(permit);
+                });
             }
 
-            println!("Crawling completed. Indexed {} pages.", page_count);
+            tracing::info!(
+                pages = page_count.load(Ordering::SeqCst),
+                "crawling completed"
+            );
         }
         Some(("search", sub_matches)) => {
             let query = sub_matches.get_one::<String>("query").unwrap();
@@ -234,4 +305,18 @@ async fn fetch_page(
     let body = res.collect().await?.to_bytes();
     let content = String::from_utf8(body.to_vec())?;
     Ok(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_enqueue_links_until_page_limit_is_reached() {
+        assert!(should_enqueue_links(0, 1));
+        assert!(should_enqueue_links(99, 100));
+        assert!(!should_enqueue_links(100, 100));
+        assert!(!should_enqueue_links(101, 100));
+        assert!(!should_enqueue_links(0, 0));
+    }
 }
