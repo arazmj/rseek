@@ -11,13 +11,22 @@ use probly_search::Index;
 use scraper::{Html, Selector};
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::env;
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Arc;
+use store::{PageStore, StoredPage};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
 mod page;
+mod store;
+
+struct IndexablePage {
+    title: Option<String>,
+    content: String,
+}
 
 fn extract_title(p: &Page) -> Vec<&str> {
     if let Some(title) = &p.title {
@@ -29,6 +38,34 @@ fn extract_title(p: &Page) -> Vec<&str> {
 
 fn extract_content(p: &Page) -> Vec<&str> {
     vec![&p.content]
+}
+
+fn extract_indexable_title(p: &IndexablePage) -> Vec<&str> {
+    if let Some(title) = &p.title {
+        vec![title]
+    } else {
+        vec![]
+    }
+}
+
+fn extract_indexable_content(p: &IndexablePage) -> Vec<&str> {
+    vec![&p.content]
+}
+
+fn default_store_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join("rseek")
+        .join("pages.jsonl")
+}
+
+fn store_arg() -> Arg {
+    Arg::new("store")
+        .help("Path to the JSONL page store")
+        .short('s')
+        .long("store")
+        .value_name("PATH")
+        .value_parser(clap::value_parser!(PathBuf))
 }
 
 // A white space tokenizer
@@ -84,17 +121,27 @@ async fn crawl_url(
     Ok(Page::new(html))
 }
 
-#[tracing::instrument(skip(client, tx, index))]
+#[tracing::instrument(skip(client, tx, index, store))]
 async fn crawl_worker(
     url: String,
     client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
     tx: mpsc::Sender<String>,
     index: Arc<Mutex<Index<usize>>>,
     page_id: usize,
+    store: Arc<PageStore>,
 ) {
     match crawl_url(url.clone(), client).await {
         Ok(page) => {
             tracing::info!(url = %url, links = page.hrefs.len(), "crawled page");
+
+            let stored_page = StoredPage {
+                url: url.clone(),
+                title: page.title.clone(),
+                content: page.content.clone(),
+            };
+            if let Err(err) = store.append(&stored_page) {
+                tracing::error!(url = %url, error = %err, "error storing page");
+            }
 
             let mut index = index.lock().await;
             index.add_document(&[extract_title, extract_content], tokenizer, page_id, &page);
@@ -141,7 +188,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .short('c')
                         .long("concurrency")
                         .default_value("10"),
-                ),
+                )
+                .arg(store_arg()),
         )
         .subcommand(
             Command::new("search")
@@ -151,7 +199,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .help("The search query")
                         .required(true)
                         .index(1),
-                ),
+                )
+                .arg(store_arg()),
         )
         .get_matches();
 
@@ -163,6 +212,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap()
                 .parse::<usize>()
                 .unwrap_or(10);
+            let store_path = sub_matches
+                .get_one::<PathBuf>("store")
+                .cloned()
+                .unwrap_or_else(default_store_path);
+            let store = Arc::new(PageStore::open(store_path.clone())?);
+            tracing::info!(path = ?store_path, "storing crawled pages");
 
             // Create a new HTTP client with HTTPS support
             let https = HttpsConnector::new();
@@ -186,31 +241,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let semaphore = semaphore.clone();
                 let client = client.clone();
                 let index = index.clone();
+                let store = store.clone();
 
                 if !is_visited(&url, &visited).await {
                     let permit = semaphore.acquire_owned().await?;
 
                     tokio::spawn(async move {
-                        crawl_worker(url, client, tx, index, page_count).await;
+                        crawl_worker(url, client, tx, index, page_count, store).await;
                         drop(permit);
                     });
                 }
                 page_count += 1;
             }
 
-            println!("Crawling completed. Indexed {} pages.", page_count);
+            tracing::info!(page_count, "crawling completed");
         }
         Some(("search", sub_matches)) => {
             let query = sub_matches.get_one::<String>("query").unwrap();
+            let store_path = sub_matches
+                .get_one::<PathBuf>("store")
+                .cloned()
+                .unwrap_or_else(default_store_path);
+            let pages = PageStore::read_all(&store_path)?;
+            let mut index = Index::<usize>::new(2);
 
-            // TODO: Load the index
-            let index = Index::<usize>::new(2);
+            for (id, page) in pages.iter().enumerate() {
+                let indexable = IndexablePage {
+                    title: page.title.clone(),
+                    content: page.content.clone(),
+                };
+                index.add_document(
+                    &[extract_indexable_title, extract_indexable_content],
+                    tokenizer,
+                    id,
+                    &indexable,
+                );
+            }
 
             // Search through the index
             let result = index.query(query, &mut bm25::new(), tokenizer, &[1., 1.]);
-            println!("Search results:");
+            tracing::info!(path = ?store_path, "searching stored pages");
             for (i, res) in result.iter().enumerate() {
-                println!("{}. Score: {}", i + 1, res.score);
+                if let Some(page) = pages.get(res.key) {
+                    tracing::info!(
+                        position = i + 1,
+                        url = %page.url,
+                        title = page.title.as_deref().unwrap_or("<untitled>"),
+                        score = res.score,
+                        "search result"
+                    );
+                }
             }
         }
         _ => unreachable!(),
