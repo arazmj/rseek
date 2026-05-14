@@ -1,7 +1,8 @@
 use bytes::Bytes;
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use http_body_util::{BodyExt, Empty};
-use hyper::{Request, Uri};
+use hyper::header::USER_AGENT as USER_AGENT_HEADER;
+use hyper::{Request, StatusCode, Uri};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
@@ -13,11 +14,14 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
+use texting_robots::{get_robots_url, Robot};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
 mod page;
+
+const USER_AGENT: &str = "rseek";
 
 fn extract_title(p: &Page) -> Vec<&str> {
     if let Some(title) = &p.title {
@@ -74,7 +78,108 @@ fn make_absolute_url(base: &str, href: &str) -> Option<String> {
     }
 }
 
+fn is_allowed(robot: &Option<Robot>, url: &str) -> bool {
+    robot.as_ref().map_or(true, |robot| robot.allowed(url))
+}
+
 #[tracing::instrument(skip(client))]
+async fn fetch_robots(
+    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
+    seed_url: &str,
+) -> Option<Robot> {
+    let robots_url = match get_robots_url(seed_url) {
+        Ok(url) => url,
+        Err(e) => {
+            tracing::warn!(
+                seed_url = %seed_url,
+                error = %e,
+                "could not determine robots.txt URL; allowing all URLs"
+            );
+            return None;
+        }
+    };
+
+    let uri = match robots_url.parse::<Uri>() {
+        Ok(uri) => uri,
+        Err(e) => {
+            tracing::warn!(
+                robots_url = %robots_url,
+                error = %e,
+                "invalid robots.txt URL; allowing all URLs"
+            );
+            return None;
+        }
+    };
+
+    let req = match Request::builder()
+        .uri(uri)
+        .header(USER_AGENT_HEADER, USER_AGENT)
+        .body(Empty::new())
+    {
+        Ok(req) => req,
+        Err(e) => {
+            tracing::warn!(
+                robots_url = %robots_url,
+                error = %e,
+                "could not build robots.txt request; allowing all URLs"
+            );
+            return None;
+        }
+    };
+
+    let res = match client.request(req).await {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::warn!(
+                robots_url = %robots_url,
+                error = %e,
+                "could not fetch robots.txt; allowing all URLs"
+            );
+            return None;
+        }
+    };
+
+    let status = res.status();
+    if status == StatusCode::NOT_FOUND {
+        tracing::warn!(
+            robots_url = %robots_url,
+            "robots.txt not found; allowing all URLs"
+        );
+        return None;
+    }
+    if !status.is_success() {
+        tracing::warn!(
+            robots_url = %robots_url,
+            status = %status,
+            "robots.txt fetch returned error; allowing all URLs"
+        );
+        return None;
+    }
+
+    let body = match res.collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(e) => {
+            tracing::warn!(
+                robots_url = %robots_url,
+                error = %e,
+                "could not read robots.txt; allowing all URLs"
+            );
+            return None;
+        }
+    };
+
+    match Robot::new(USER_AGENT, body.as_ref()) {
+        Ok(robot) => Some(robot),
+        Err(e) => {
+            tracing::warn!(
+                robots_url = %robots_url,
+                error = %e,
+                "could not parse robots.txt; allowing all URLs"
+            );
+            None
+        }
+    }
+}
 async fn crawl_url(
     url: String,
     client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
@@ -141,6 +246,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .short('c')
                         .long("concurrency")
                         .default_value("10"),
+                )
+                .arg(
+                    Arg::new("ignore-robots")
+                        .help("Ignore robots.txt rules")
+                        .long("ignore-robots")
+                        .action(ArgAction::SetTrue),
                 ),
         )
         .subcommand(
@@ -163,11 +274,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap()
                 .parse::<usize>()
                 .unwrap_or(10);
+            let ignore_robots = sub_matches.get_flag("ignore-robots");
 
             // Create a new HTTP client with HTTPS support
             let https = HttpsConnector::new();
             let client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>> =
                 Client::builder(TokioExecutor::new()).build(https);
+            let robot = if ignore_robots {
+                tracing::info!("ignoring robots.txt rules");
+                None
+            } else {
+                fetch_robots(client.clone(), url).await
+            };
 
             // Setup crawling infrastructure
             let (tx, mut rx) = mpsc::channel(100);
@@ -181,6 +299,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             // Process URLs
             while let Some(url) = rx.recv().await {
+                if !is_allowed(&robot, &url) {
+                    tracing::info!(url = %url, "skipping URL disallowed by robots.txt");
+                    continue;
+                }
+
                 let tx = tx.clone();
                 let visited = visited.clone();
                 let semaphore = semaphore.clone();
@@ -198,7 +321,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 page_count += 1;
             }
 
-            println!("Crawling completed. Indexed {} pages.", page_count);
+            tracing::info!(pages = page_count, "crawling completed");
         }
         Some(("search", sub_matches)) => {
             let query = sub_matches.get_one::<String>("query").unwrap();
@@ -208,9 +331,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             // Search through the index
             let result = index.query(query, &mut bm25::new(), tokenizer, &[1., 1.]);
-            println!("Search results:");
+            tracing::info!(query = %query, results_count = result.len(), "search completed");
             for (i, res) in result.iter().enumerate() {
-                println!("{}. Score: {}", i + 1, res.score);
+                tracing::info!(rank = i + 1, score = res.score, "search result");
             }
         }
         _ => unreachable!(),
@@ -225,7 +348,10 @@ async fn fetch_page(
     uri: Uri,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     tracing::debug!(%uri, "fetching page");
-    let req = Request::builder().uri(uri).body(Empty::new())?;
+    let req = Request::builder()
+        .uri(uri)
+        .header(USER_AGENT_HEADER, USER_AGENT)
+        .body(Empty::new())?;
 
     // Send the request and get the response
     let res = client.request(req).await?;

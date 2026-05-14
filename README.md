@@ -36,6 +36,11 @@ rseek crawl <url> [--concurrency <number>]
 Options:
 - `url`: The seed URL to start crawling from
 - `--concurrency` or `-c`: Number of concurrent requests (default: 10)
+- `--ignore-robots`: Skip robots.txt checks
+
+#### Robots.txt
+
+By default, RSeek fetches `<seed-origin>/robots.txt` before crawling and skips URLs disallowed for the `rseek` user agent. If robots.txt is missing or unreachable, crawling continues with a warning. Use `--ignore-robots` to bypass this check.
 
 Example:
 ```bash
