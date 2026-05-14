@@ -62,12 +62,12 @@ fn make_absolute_url(base: &str, href: &str) -> Option<String> {
     if href.starts_with("http://") || href.starts_with("https://") {
         Some(href.to_string())
     } else if href.starts_with("//") {
-        Some(format!("https:{}", href))
+        Some(format!("https:{href}"))
     } else if href.starts_with('/') {
         let base_url = Url::parse(base).ok()?;
         let scheme = base_url.scheme();
         let host = base_url.host_str()?;
-        Some(format!("{}://{}{}", scheme, host, href))
+        Some(format!("{scheme}://{host}{href}"))
     } else {
         let base_url = Url::parse(base).ok()?;
         base_url.join(href).ok().map(|u| u.to_string())
@@ -191,14 +191,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let permit = semaphore.acquire_owned().await?;
 
                     tokio::spawn(async move {
+<<<<<<< HEAD
                         crawl_worker(url, client, tx, index, page_count).await;
+=======
+                        match crawl_url(url.clone(), client).await {
+                            Ok(page) => {
+                                println!("Crawled: {url}");
+                                println!("Found {} links", page.hrefs.len());
+
+                                // Add page to search index
+                                let mut index = index.lock().await;
+                                index.add_document(
+                                    &[extract_title, extract_content],
+                                    tokenizer,
+                                    page_count,
+                                    &page,
+                                );
+
+                                // Send new links to be crawled
+                                for link in page.hrefs {
+                                    let link = make_absolute_url(&url, &link);
+                                    if let Some(link) = link {
+                                        tx.send(link).await.ok();
+                                    }
+                                }
+                            }
+                            Err(e) => println!("Error crawling {url}: {e}"),
+                        }
+>>>>>>> f2bec65 (ci: add GitHub Actions workflow)
                         drop(permit);
                     });
                 }
                 page_count += 1;
             }
 
-            println!("Crawling completed. Indexed {} pages.", page_count);
+            println!("Crawling completed. Indexed {page_count} pages.");
         }
         Some(("search", sub_matches)) => {
             let query = sub_matches.get_one::<String>("query").unwrap();
@@ -219,12 +246,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+<<<<<<< HEAD
 #[tracing::instrument(skip(client))]
+=======
+>>>>>>> f2bec65 (ci: add GitHub Actions workflow)
 async fn fetch_page(
     client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
     uri: Uri,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+<<<<<<< HEAD
     tracing::debug!(%uri, "fetching page");
+=======
+>>>>>>> f2bec65 (ci: add GitHub Actions workflow)
     let req = Request::builder().uri(uri).body(Empty::new())?;
 
     // Send the request and get the response
