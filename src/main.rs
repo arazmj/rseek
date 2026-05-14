@@ -235,3 +235,77 @@ async fn fetch_page(
     let content = String::from_utf8(body.to_vec())?;
     Ok(content)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extractor_helpers_return_page_fields_for_indexing() {
+        let titled = Page {
+            title: Some("Example Title".to_string()),
+            content: "Example body".to_string(),
+            hrefs: vec![],
+        };
+        let untitled = Page {
+            title: None,
+            content: "Untitled body".to_string(),
+            hrefs: vec![],
+        };
+
+        assert_eq!(extract_title(&titled), vec!["Example Title"]);
+        assert!(extract_title(&untitled).is_empty());
+        assert_eq!(extract_content(&titled), vec!["Example body"]);
+    }
+
+    #[test]
+    fn tokenizer_splits_on_spaces() {
+        let tokens = tokenizer("rust search tool")
+            .into_iter()
+            .map(|token| token.into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(tokens, vec!["rust", "search", "tool"]);
+    }
+
+    #[test]
+    fn parse_links_returns_only_http_links() {
+        let html = r#"
+            <a href="https://example.com/a">A</a>
+            <a href="http://example.com/b">B</a>
+            <a href="/relative">Relative</a>
+            <a>No href</a>
+        "#;
+
+        assert_eq!(
+            parse_links(html),
+            vec![
+                "https://example.com/a".to_string(),
+                "http://example.com/b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn make_absolute_url_handles_absolute_scheme_relative_root_and_relative_links() {
+        let base = "https://example.com/docs/index.html";
+
+        assert_eq!(
+            make_absolute_url(base, "https://rust-lang.org"),
+            Some("https://rust-lang.org".to_string())
+        );
+        assert_eq!(
+            make_absolute_url(base, "//cdn.example.com/app.js"),
+            Some("https://cdn.example.com/app.js".to_string())
+        );
+        assert_eq!(
+            make_absolute_url(base, "/about"),
+            Some("https://example.com/about".to_string())
+        );
+        assert_eq!(
+            make_absolute_url(base, "guide/start.html"),
+            Some("https://example.com/docs/guide/start.html".to_string())
+        );
+        assert_eq!(make_absolute_url("not a url", "/about"), None);
+    }
+}
