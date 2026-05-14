@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use http_body_util::{BodyExt, Empty};
 use hyper::{Request, Uri};
 use hyper_tls::HttpsConnector;
@@ -74,6 +74,41 @@ fn make_absolute_url(base: &str, href: &str) -> Option<String> {
     }
 }
 
+pub fn normalize_url(raw: &str) -> Option<String> {
+    let mut url = Url::parse(raw).ok()?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return None;
+    }
+
+    url.set_fragment(None);
+
+    let default_port = match url.scheme() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    if url.port_or_known_default() == default_port && url.port().is_some() {
+        url.set_port(None).ok()?;
+    }
+
+    let mut normalized = url.to_string();
+    if url.path() == "/" && url.query().is_none() {
+        normalized.pop();
+    }
+
+    Some(normalized)
+}
+
+fn is_same_origin(url: &str, seed_host: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.eq_ignore_ascii_case(seed_host))
+        })
+        .unwrap_or(false)
+}
+
 #[tracing::instrument(skip(client))]
 async fn crawl_url(
     url: String,
@@ -91,6 +126,8 @@ async fn crawl_worker(
     tx: mpsc::Sender<String>,
     index: Arc<Mutex<Index<usize>>>,
     page_id: usize,
+    seed_host: String,
+    allow_cross_origin: bool,
 ) {
     match crawl_url(url.clone(), client).await {
         Ok(page) => {
@@ -102,9 +139,13 @@ async fn crawl_worker(
 
             for link in page.hrefs {
                 if let Some(link) = make_absolute_url(&url, &link) {
-                    tracing::debug!(url = %url, link = %link, "queueing discovered link");
-                    if tx.send(link).await.is_err() {
-                        tracing::warn!(url = %url, "failed to queue discovered link because crawler channel is closed");
+                    if let Some(normalized_link) = normalize_url(&link) {
+                        if allow_cross_origin || is_same_origin(&normalized_link, &seed_host) {
+                            tracing::debug!(url = %url, link = %normalized_link, "queueing discovered link");
+                            if tx.send(normalized_link).await.is_err() {
+                                tracing::warn!(url = %url, "failed to queue discovered link because crawler channel is closed");
+                            }
+                        }
                     }
                 }
             }
@@ -141,6 +182,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .short('c')
                         .long("concurrency")
                         .default_value("10"),
+                )
+                .arg(
+                    Arg::new("allow-cross-origin")
+                        .help("Allow crawling links outside the seed URL origin")
+                        .long("allow-cross-origin")
+                        .action(ArgAction::SetTrue),
                 ),
         )
         .subcommand(
@@ -158,6 +205,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match matches.subcommand() {
         Some(("crawl", sub_matches)) => {
             let url = sub_matches.get_one::<String>("url").unwrap();
+            let seed_url = Url::parse(url).unwrap();
+            let seed_host = seed_url.host_str().unwrap().to_owned();
+            let allow_cross_origin = sub_matches.get_flag("allow-cross-origin");
             let concurrency = sub_matches
                 .get_one::<String>("concurrency")
                 .unwrap()
@@ -177,7 +227,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut page_count = 0;
 
             // Send the initial URL
-            tx.send(url.clone()).await?;
+            tx.send(normalize_url(url).unwrap()).await?;
 
             // Process URLs
             while let Some(url) = rx.recv().await {
@@ -186,19 +236,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let semaphore = semaphore.clone();
                 let client = client.clone();
                 let index = index.clone();
+                let seed_host = seed_host.clone();
+
+                let Some(url) = normalize_url(&url) else {
+                    continue;
+                };
 
                 if !is_visited(&url, &visited).await {
                     let permit = semaphore.acquire_owned().await?;
 
                     tokio::spawn(async move {
-                        crawl_worker(url, client, tx, index, page_count).await;
+                        crawl_worker(url, client, tx, index, page_count, seed_host, allow_cross_origin).await;
                         drop(permit);
                     });
                 }
                 page_count += 1;
             }
 
-            println!("Crawling completed. Indexed {} pages.", page_count);
+            tracing::info!("Crawling completed. Indexed {} pages.", page_count);
         }
         Some(("search", sub_matches)) => {
             let query = sub_matches.get_one::<String>("query").unwrap();
@@ -234,4 +289,36 @@ async fn fetch_page(
     let body = res.collect().await?.to_bytes();
     let content = String::from_utf8(body.to_vec())?;
     Ok(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_url;
+
+    #[test]
+    fn normalizes_scheme_host_fragment_default_ports_and_root_path() {
+        assert_eq!(
+            normalize_url("https://Example.COM/Foo#bar"),
+            Some("https://example.com/Foo".to_string())
+        );
+        assert_eq!(
+            normalize_url("http://example.com:80/x"),
+            Some("http://example.com/x".to_string())
+        );
+        assert_eq!(
+            normalize_url("https://example.com:443/y"),
+            Some("https://example.com/y".to_string())
+        );
+        assert_eq!(
+            normalize_url("https://example.com/"),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_urls() {
+        assert_eq!(normalize_url("mailto:foo@bar.com"), None);
+        assert_eq!(normalize_url("javascript:alert(1)"), None);
+        assert_eq!(normalize_url("not a url"), None);
+    }
 }
