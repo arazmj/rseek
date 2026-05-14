@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -78,9 +79,10 @@ fn make_absolute_url(base: &str, href: &str) -> Option<String> {
 async fn crawl_url(
     url: String,
     client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
+    timeout_secs: u64,
 ) -> Result<Page, Box<dyn Error + Send + Sync>> {
     let uri = url.parse::<Uri>()?;
-    let html = fetch_page(client, uri).await?;
+    let html = fetch_page(client, uri, timeout_secs).await?;
     Ok(Page::new(html))
 }
 
@@ -91,8 +93,9 @@ async fn crawl_worker(
     tx: mpsc::Sender<String>,
     index: Arc<Mutex<Index<usize>>>,
     page_id: usize,
+    timeout_secs: u64,
 ) {
-    match crawl_url(url.clone(), client).await {
+    match crawl_url(url.clone(), client, timeout_secs).await {
         Ok(page) => {
             tracing::info!(url = %url, links = page.hrefs.len(), "crawled page");
 
@@ -141,6 +144,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .short('c')
                         .long("concurrency")
                         .default_value("10"),
+                )
+                .arg(
+                    Arg::new("timeout")
+                        .help("Request timeout in seconds")
+                        .short('t')
+                        .long("timeout")
+                        .default_value("10")
+                        .value_parser(clap::value_parser!(u64)),
                 ),
         )
         .subcommand(
@@ -163,6 +174,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap()
                 .parse::<usize>()
                 .unwrap_or(10);
+            let timeout_secs = sub_matches.get_one::<u64>("timeout").copied().unwrap_or(10);
 
             // Create a new HTTP client with HTTPS support
             let https = HttpsConnector::new();
@@ -186,12 +198,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let semaphore = semaphore.clone();
                 let client = client.clone();
                 let index = index.clone();
+                let timeout_secs = timeout_secs;
 
                 if !is_visited(&url, &visited).await {
                     let permit = semaphore.acquire_owned().await?;
 
                     tokio::spawn(async move {
-                        crawl_worker(url, client, tx, index, page_count).await;
+                        crawl_worker(url, client, tx, index, page_count, timeout_secs).await;
                         drop(permit);
                     });
                 }
@@ -223,15 +236,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
 async fn fetch_page(
     client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
     uri: Uri,
+    timeout_secs: u64,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     tracing::debug!(%uri, "fetching page");
-    let req = Request::builder().uri(uri).body(Empty::new())?;
+    let uri_display = uri.to_string();
+    let req = Request::builder()
+        .uri(uri)
+        .header(
+            hyper::header::USER_AGENT,
+            format!(
+                "rseek/{} (+https://github.com/arazmj/rseek)",
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .body(Empty::new())?;
 
     // Send the request and get the response
-    let res = client.request(req).await?;
+    let res = tokio::time::timeout(Duration::from_secs(timeout_secs), client.request(req))
+        .await
+        .map_err(|_| format!("request timed out after {}s", timeout_secs))??;
+    if !res.status().is_success() {
+        return Err(format!("HTTP {} for {}", res.status(), uri_display).into());
+    }
 
     // Get the response body and convert to string
     let body = res.collect().await?.to_bytes();
-    let content = String::from_utf8(body.to_vec())?;
-    Ok(content)
+    Ok(decode_body(&body))
+}
+
+fn decode_body(bytes: &[u8]) -> String {
+    // Sites often serve non-UTF-8 charsets; index garbled-but-mostly-correct
+    // content rather than skipping the page entirely.
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_body_replaces_invalid_utf8() {
+        let decoded = decode_body(&[0xC3, 0x28]);
+
+        assert!(decoded.contains('\u{FFFD}'));
+    }
 }
