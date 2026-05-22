@@ -58,6 +58,10 @@ Example:
 rseek search "rust programming"
 ```
 
+### Logging
+
+RSeek uses structured tracing logs for crawler activity. Set `RUST_LOG=debug` to include detailed crawl and fetch diagnostics, or omit it to use the default `info` level.
+
 ## Dependencies
 
 - `hyper` - HTTP client and server

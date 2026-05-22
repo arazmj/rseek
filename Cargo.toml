@@ -16,3 +16,5 @@ probly-search = "2.0.1"
 clap = { version = "4.5", features = ["derive"] }
 hyper-tls = "0.6"
 url = { version = "2.5.4"}
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
