@@ -12,20 +12,21 @@ pub struct StoredPage {
 }
 
 pub struct PageStore {
-    path: PathBuf,
     file: Mutex<BufWriter<File>>,
 }
 
 impl PageStore {
     pub fn open(path: PathBuf) -> io::Result<Self> {
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)?;
         }
 
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         Ok(Self {
-            path,
             file: Mutex::new(BufWriter::new(file)),
         })
     }
@@ -34,7 +35,7 @@ impl PageStore {
         let mut file = self
             .file
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "page store lock poisoned"))?;
+            .map_err(|_| io::Error::other("page store lock poisoned"))?;
 
         serde_json::to_writer(&mut *file, page).map_err(io::Error::other)?;
         file.write_all(b"\n")?;
@@ -61,10 +62,6 @@ impl PageStore {
         }
 
         Ok(pages)
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 
