@@ -20,6 +20,7 @@ use std::sync::{
 use std::time::Duration;
 use store::{PageStore, StoredPage};
 use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -306,6 +307,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let semaphore = Arc::new(Semaphore::new(concurrency));
             let index = Arc::new(Mutex::new(Index::<usize>::new(2)));
             let page_count = Arc::new(AtomicUsize::new(0));
+            let mut workers = JoinSet::new();
+            let mut shutdown_requested = false;
+            let ctrl_c = tokio::signal::ctrl_c();
+            tokio::pin!(ctrl_c);
 
             tx.send(CrawlItem {
                 url: normalized_seed,
@@ -314,43 +319,92 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?;
             drop(tx);
 
-            while let Some(CrawlItem { url, tx }) = rx.recv().await {
-                let Some(url) = normalize_url(&url) else {
-                    continue;
-                };
+            loop {
+                tokio::select! {
+                    signal = &mut ctrl_c => {
+                        if let Err(error) = signal {
+                            tracing::error!(error = %error, "failed to listen for Ctrl-C");
+                        }
+                        tracing::info!("received Ctrl-C; stopping URL scheduling");
+                        shutdown_requested = true;
+                        rx.close();
+                        break;
+                    }
+                    maybe_item = rx.recv() => {
+                        let Some(CrawlItem { url, tx }) = maybe_item else {
+                            break;
+                        };
+                        let Some(url) = normalize_url(&url) else {
+                            continue;
+                        };
 
-                if !should_enqueue_links(page_count.load(Ordering::SeqCst), max_pages)
-                    || is_visited(&url, &visited).await
-                {
-                    continue;
+                        if !should_enqueue_links(page_count.load(Ordering::SeqCst), max_pages)
+                            || is_visited(&url, &visited).await
+                        {
+                            continue;
+                        }
+
+                        let semaphore = semaphore.clone();
+                        let client = client.clone();
+                        let index = index.clone();
+                        let page_count = page_count.clone();
+                        let store = store.clone();
+                        let seed_origin = seed_origin.clone();
+
+                        workers.spawn(async move {
+                            let Ok(permit) = semaphore.acquire_owned().await else {
+                                return;
+                            };
+                            crawl_worker(
+                                url,
+                                client,
+                                tx,
+                                index,
+                                page_count,
+                                store,
+                                max_pages,
+                                seed_origin,
+                                allow_cross_origin,
+                                timeout_secs,
+                            )
+                            .await;
+                            drop(permit);
+                        });
+                    }
+                    result = workers.join_next(), if !workers.is_empty() => {
+                        if let Some(Err(error)) = result {
+                            tracing::error!(error = %error, "crawl worker failed");
+                        }
+                    }
+                }
+            }
+
+            if shutdown_requested {
+                let drain_result = tokio::time::timeout(Duration::from_secs(5), async {
+                    while let Some(result) = workers.join_next().await {
+                        if let Err(error) = result {
+                            tracing::error!(error = %error, "crawl worker failed during shutdown");
+                        }
+                    }
+                })
+                .await;
+
+                if drain_result.is_err() {
+                    tracing::warn!("timed out waiting for crawl workers; aborting remaining work");
+                    workers.abort_all();
+                    while workers.join_next().await.is_some() {}
                 }
 
-                let semaphore = semaphore.clone();
-                let client = client.clone();
-                let index = index.clone();
-                let page_count = page_count.clone();
-                let store = store.clone();
-                let seed_origin = seed_origin.clone();
-
-                tokio::spawn(async move {
-                    let Ok(permit) = semaphore.acquire_owned().await else {
-                        return;
-                    };
-                    crawl_worker(
-                        url,
-                        client,
-                        tx,
-                        index,
-                        page_count,
-                        store,
-                        max_pages,
-                        seed_origin,
-                        allow_cross_origin,
-                        timeout_secs,
-                    )
-                    .await;
-                    drop(permit);
-                });
+                tracing::info!(
+                    pages = page_count.load(Ordering::SeqCst),
+                    "shutdown summary"
+                );
+            } else {
+                while let Some(result) = workers.join_next().await {
+                    if let Err(error) = result {
+                        tracing::error!(error = %error, "crawl worker failed");
+                    }
+                }
             }
 
             tracing::info!(
