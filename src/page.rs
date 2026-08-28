@@ -15,8 +15,7 @@ impl Page {
         }
     }
 
-    fn parse_links(html: &String) -> Vec<String> {
-        // Parse the HTML content
+    fn parse_links(html: &str) -> Vec<String> {
         let document = Html::parse_document(html);
         let selector = Selector::parse("a").unwrap();
 
@@ -26,7 +25,7 @@ impl Page {
             .collect()
     }
 
-    fn parse_content(html: &String) -> String {
+    fn parse_content(html: &str) -> String {
         let document = Html::parse_document(html);
         let body_selector = Selector::parse("body").unwrap();
 
@@ -37,7 +36,7 @@ impl Page {
             .join(" ")
     }
 
-    fn parse_title(html: &String) -> Option<String> {
+    fn parse_title(html: &str) -> Option<String> {
         let document = Html::parse_document(html);
         let selector = Selector::parse("title").unwrap();
         document
