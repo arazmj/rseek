@@ -1,86 +1,103 @@
-# RSeek
+# rseek
 
-RSeek is a powerful web crawler and search tool written in Rust. It allows you to crawl web pages and perform full-text search on the crawled content.
+rseek is a Rust CLI for crawling web pages and searching the crawled corpus with BM25 ranking. Crawling stays on the seed URL's origin by default, persists fetched pages to a JSONL store, and `search` rebuilds an index from that store on demand.
 
-## Features
+## Status
 
-- Web crawling with configurable concurrency
-- Full-text search using BM25 ranking algorithm
-- HTML parsing and link extraction
-- Support for both HTTP and HTTPS
-- Concurrent request handling with Tokio
-- Command-line interface with subcommands
+`rseek search` requires a prior `rseek crawl`; the search index is not a long-running service or prebuilt database. Pages are stored as JSONL, then indexed on demand when you run `search`.
 
-## Installation
+Default store path:
 
-Since this is a Rust project, you'll need to have Rust and Cargo installed. You can install them from [rustup.rs](https://rustup.rs/).
+- Windows: `%LOCALAPPDATA%\rseek\pages.jsonl`
+- Linux: `$XDG_DATA_HOME/rseek/pages.jsonl`, or `~/.local/share/rseek/pages.jsonl` when `XDG_DATA_HOME` is unset
+- macOS: `~/Library/Application Support/rseek/pages.jsonl`
 
-To build the project:
+Requires Rust 1.74+.
+
+## Install
+
+Install directly from GitHub:
 
 ```bash
+cargo install --git https://github.com/arazmj/rseek
+```
+
+Or build from a clone:
+
+```bash
+git clone https://github.com/arazmj/rseek.git
+cd rseek
 cargo build --release
 ```
 
-## Usage
+The local binary is written to `target/release/rseek`.
 
-RSeek provides two main commands:
-
-### Crawl
-
-Crawl a webpage and extract its content:
+## Quick start
 
 ```bash
-rseek crawl <url> [--concurrency <number>]
+rseek crawl https://example.com --max-pages 10
+rseek search "domain"
+rseek search "example domain"
 ```
 
-Options:
-- `url`: The seed URL to start crawling from
-- `--concurrency` or `-c`: Number of concurrent requests (default: 10)
+Expected output shape:
 
-Example:
+```text
+INFO rseek: search result position=1 url=https://example.com title="Example Domain" score=1.23
+```
+
+Each result includes its rank, URL, title, and BM25 score.
+
+## `crawl` reference
+
 ```bash
-rseek crawl https://example.com -c 20
+rseek crawl <url> [options]
 ```
 
-### Search
+- `url` positional: seed URL to crawl.
+- `--concurrency`, `-c` (default: `10`): maximum concurrent fetches.
+- `--max-pages`, `-m` (default: `100`): maximum pages to store before exiting.
+- `--timeout`, `-t` (default: `10s`): HTTP request timeout.
+- `--allow-cross-origin` (default: off): allow crawling links outside the seed URL's origin.
+- `--ignore-robots` (default: off): skip robots.txt checks.
+- `--store`, `-s` (default: platform data path above): JSONL page store.
 
-Search through the crawled content:
+By default, the crawler follows normalized HTTP(S) links on the same origin as the seed URL. It fetches and applies robots.txt rules for each origin it visits; missing, invalid, or unreachable robots files produce a warning and allow crawling. Press Ctrl-C to stop scheduling URLs and give active requests up to five seconds to finish.
+
+The store is append-only. Reusing a store path preserves pages from earlier crawls.
+
+## `search` reference
 
 ```bash
-rseek search <query>
+rseek search <query> [options]
 ```
 
-Options:
-- `query`: The search query to look for in the crawled content
+- `query` positional: search terms to rank against stored pages.
+- `--store`, `-s` (default: platform data path above): JSONL page store to read.
 
-Example:
-```bash
-rseek search "rust programming"
-```
+Search is case-insensitive and punctuation-aware.
 
 ### Logging
 
 RSeek uses structured tracing logs for crawler activity. Set `RUST_LOG=debug` to include detailed crawl and fetch diagnostics, or omit it to use the default `info` level.
 
-## Dependencies
+## How it works
 
-- `hyper` - HTTP client and server
-- `tokio` - Async runtime
-- `scraper` - HTML parsing
-- `probly-search` - Full-text search functionality
-- `clap` - Command-line argument parsing
-- `html_parser` - HTML parsing utilities
-- `url` - URL parsing and manipulation
+The crawl loop fetches pages with bounded concurrency using `tokio::sync::Semaphore`, extracts links, normalizes URLs, honors robots.txt, and stops once `--max-pages` is reached, no eligible URLs remain, or Ctrl-C is received. HTTP requests use a descriptive User-Agent, success-status checks, lossy UTF-8 decoding, and the configured timeout.
 
-## Project Structure
+Fetched pages are appended to a JSONL store so crawl and search are decoupled. Each `search` command reads that store, rebuilds an in-memory index, tokenizes text case-insensitively, and ranks results with BM25 via `probly-search`.
 
-- `src/main.rs` - Main application entry point
-- `src/page.rs` - Page structure and parsing logic
+## Project structure
+
+- `src/main.rs` - CLI entry point and command wiring.
+- `src/page.rs` - page model and HTML extraction.
+- `src/store.rs` - JSONL persistence.
+- `src/tokenizer.rs` - search tokenization.
 
 ## License
 
-This project is open source and available under the MIT License.
+MIT.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. 
+Contributions are welcome. Please open an issue or pull request at https://github.com/arazmj/rseek/issues with bugs, feature requests, or implementation notes.
