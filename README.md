@@ -43,10 +43,10 @@ rseek search "example domain"
 Expected output shape:
 
 ```text
-https://example.com/ · Example Domain · 1.23
+INFO rseek: search result position=1 url=https://example.com title="Example Domain" score=1.23
 ```
 
-Each result prints `URL · title · score`.
+Each result includes its rank, URL, title, and BM25 score.
 
 ## `crawl` reference
 
@@ -58,10 +58,13 @@ rseek crawl <url> [options]
 - `--concurrency`, `-c` (default: `10`): maximum concurrent fetches.
 - `--max-pages`, `-m` (default: `100`): maximum pages to store before exiting.
 - `--timeout`, `-t` (default: `10s`): HTTP request timeout.
-- `--allow-cross-origin` (default: off): allow crawling links outside the seed URL's host.
+- `--allow-cross-origin` (default: off): allow crawling links outside the seed URL's origin.
+- `--ignore-robots` (default: off): skip robots.txt checks.
 - `--store`, `-s` (default: platform data path above): JSONL page store.
 
-By default, the crawler follows normalized HTTP(S) links on the same host as the seed URL.
+By default, the crawler follows normalized HTTP(S) links on the same origin as the seed URL. It fetches and applies robots.txt rules for each origin it visits; missing, invalid, or unreachable robots files produce a warning and allow crawling. Press Ctrl-C to stop scheduling URLs and give active requests up to five seconds to finish.
+
+The store is append-only. Reusing a store path preserves pages from earlier crawls.
 
 ## `search` reference
 
@@ -80,7 +83,7 @@ RSeek uses structured tracing logs for crawler activity. Set `RUST_LOG=debug` to
 
 ## How it works
 
-The crawl loop fetches pages with bounded concurrency using `tokio::sync::Semaphore`, extracts links, normalizes URLs, and stops once `--max-pages` is reached or no more eligible URLs remain. HTTP requests use a User-Agent, status checks, and the configured timeout.
+The crawl loop fetches pages with bounded concurrency using `tokio::sync::Semaphore`, extracts links, normalizes URLs, honors robots.txt, and stops once `--max-pages` is reached, no eligible URLs remain, or Ctrl-C is received. HTTP requests use a descriptive User-Agent, success-status checks, lossy UTF-8 decoding, and the configured timeout.
 
 Fetched pages are appended to a JSONL store so crawl and search are decoupled. Each `search` command reads that store, rebuilds an in-memory index, tokenizes text case-insensitively, and ranks results with BM25 via `probly-search`.
 
