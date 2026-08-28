@@ -1,14 +1,14 @@
 use bytes::Bytes;
 use clap::{Arg, ArgAction, Command};
 use http_body_util::{BodyExt, Empty};
-use hyper::{Request, Uri};
+use hyper::{Request, StatusCode, Uri};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use page::Page;
 use probly_search::score::bm25;
 use probly_search::Index;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::io;
@@ -19,6 +19,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use store::{PageStore, StoredPage};
+use texting_robots::{get_robots_url, Robot};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
@@ -29,6 +30,13 @@ mod store;
 mod tokenizer;
 
 use tokenizer::tokenize;
+
+const ROBOTS_USER_AGENT: &str = "rseek";
+const HTTP_USER_AGENT: &str = concat!(
+    "rseek/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/arazmj/rseek)"
+);
 
 fn extract_title(p: &Page) -> Vec<&str> {
     if let Some(title) = &p.title {
@@ -119,6 +127,99 @@ fn is_same_origin(url: &str, seed_origin: &str) -> bool {
         .ok()
         .map(|url| url.origin().ascii_serialization() == seed_origin)
         .unwrap_or(false)
+}
+
+fn is_allowed(robot: Option<&Robot>, url: &str) -> bool {
+    robot.map_or(true, |robot| robot.allowed(url))
+}
+
+#[tracing::instrument(skip(client))]
+async fn fetch_robots(
+    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
+    seed_url: &str,
+    timeout_secs: u64,
+) -> Option<Robot> {
+    let robots_url = match get_robots_url(seed_url) {
+        Ok(url) => url,
+        Err(error) => {
+            tracing::warn!(seed_url, error = %error, "could not determine robots.txt URL; allowing crawl");
+            return None;
+        }
+    };
+    let uri = match robots_url.parse::<Uri>() {
+        Ok(uri) => uri,
+        Err(error) => {
+            tracing::warn!(robots_url, error = %error, "invalid robots.txt URL; allowing crawl");
+            return None;
+        }
+    };
+    let request = match Request::builder()
+        .uri(uri)
+        .header(hyper::header::USER_AGENT, HTTP_USER_AGENT)
+        .body(Empty::new())
+    {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(robots_url, error = %error, "could not build robots.txt request; allowing crawl");
+            return None;
+        }
+    };
+
+    let response = match tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        client.request(request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            tracing::warn!(robots_url, error = %error, "could not fetch robots.txt; allowing crawl");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                robots_url,
+                timeout_secs,
+                "robots.txt request timed out; allowing crawl"
+            );
+            return None;
+        }
+    };
+
+    if response.status() == StatusCode::NOT_FOUND {
+        tracing::debug!(robots_url, "robots.txt not found; allowing crawl");
+        return None;
+    }
+    if !response.status().is_success() {
+        tracing::warn!(robots_url, status = %response.status(), "robots.txt request failed; allowing crawl");
+        return None;
+    }
+
+    let body = match tokio::time::timeout(Duration::from_secs(timeout_secs), response.collect())
+        .await
+    {
+        Ok(Ok(body)) => body.to_bytes(),
+        Ok(Err(error)) => {
+            tracing::warn!(robots_url, error = %error, "could not read robots.txt; allowing crawl");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                robots_url,
+                timeout_secs,
+                "robots.txt response timed out; allowing crawl"
+            );
+            return None;
+        }
+    };
+
+    match Robot::new(ROBOTS_USER_AGENT, &body) {
+        Ok(robot) => Some(robot),
+        Err(error) => {
+            tracing::warn!(robots_url, error = %error, "could not parse robots.txt; allowing crawl");
+            None
+        }
+    }
 }
 
 #[tracing::instrument(skip(client))]
@@ -239,6 +340,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .action(ArgAction::SetTrue),
                 )
                 .arg(
+                    Arg::new("ignore-robots")
+                        .help("Ignore robots.txt rules")
+                        .long("ignore-robots")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
                     Arg::new("timeout")
                         .help("Request timeout in seconds")
                         .short('t')
@@ -272,6 +379,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             })?;
             let seed_origin = Url::parse(&normalized_seed)?.origin().ascii_serialization();
             let allow_cross_origin = sub_matches.get_flag("allow-cross-origin");
+            let ignore_robots = sub_matches.get_flag("ignore-robots");
             let concurrency = sub_matches
                 .get_one::<String>("concurrency")
                 .unwrap()
@@ -307,6 +415,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let semaphore = Arc::new(Semaphore::new(concurrency));
             let index = Arc::new(Mutex::new(Index::<usize>::new(2)));
             let page_count = Arc::new(AtomicUsize::new(0));
+            let mut robots_by_origin = HashMap::<String, Option<Robot>>::new();
             let mut workers = JoinSet::new();
             let mut shutdown_requested = false;
             let ctrl_c = tokio::signal::ctrl_c();
@@ -338,9 +447,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             continue;
                         };
 
-                        if !should_enqueue_links(page_count.load(Ordering::SeqCst), max_pages)
-                            || is_visited(&url, &visited).await
-                        {
+                        if !should_enqueue_links(page_count.load(Ordering::SeqCst), max_pages) {
+                            continue;
+                        }
+
+                        if !ignore_robots {
+                            let origin = Url::parse(&url)?.origin().ascii_serialization();
+                            if !robots_by_origin.contains_key(&origin) {
+                                let robot = fetch_robots(client.clone(), &url, timeout_secs).await;
+                                robots_by_origin.insert(origin.clone(), robot);
+                            }
+                            if !is_allowed(robots_by_origin.get(&origin).and_then(Option::as_ref), &url) {
+                                tracing::info!(url, "skipping URL disallowed by robots.txt");
+                                continue;
+                            }
+                        }
+
+                        if is_visited(&url, &visited).await {
                             continue;
                         }
 
@@ -460,13 +583,7 @@ async fn fetch_page(
     let uri_display = uri.to_string();
     let req = Request::builder()
         .uri(uri)
-        .header(
-            hyper::header::USER_AGENT,
-            format!(
-                "rseek/{} (+https://github.com/arazmj/rseek)",
-                env!("CARGO_PKG_VERSION")
-            ),
-        )
+        .header(hyper::header::USER_AGENT, HTTP_USER_AGENT)
         .body(Empty::new())?;
 
     // Send the request and get the response
@@ -545,5 +662,25 @@ mod tests {
         assert!(!should_enqueue_links(100, 100));
         assert!(!should_enqueue_links(101, 100));
         assert!(!should_enqueue_links(0, 0));
+    }
+
+    #[test]
+    fn robots_rules_allow_and_disallow_expected_paths() {
+        let robot = Robot::new(
+            ROBOTS_USER_AGENT,
+            b"User-agent: rseek\nDisallow: /private\nAllow: /private/public\n",
+        )
+        .unwrap();
+
+        assert!(is_allowed(Some(&robot), "https://example.com/"));
+        assert!(!is_allowed(
+            Some(&robot),
+            "https://example.com/private/secret"
+        ));
+        assert!(is_allowed(
+            Some(&robot),
+            "https://example.com/private/public"
+        ));
+        assert!(is_allowed(None, "https://example.com/private"));
     }
 }
