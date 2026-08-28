@@ -19,6 +19,9 @@ use tracing_subscriber::EnvFilter;
 use url::Url;
 
 mod page;
+mod tokenizer;
+
+use tokenizer::tokenize;
 
 fn extract_title(p: &Page) -> Vec<&str> {
     if let Some(title) = &p.title {
@@ -30,11 +33,6 @@ fn extract_title(p: &Page) -> Vec<&str> {
 
 fn extract_content(p: &Page) -> Vec<&str> {
     vec![&p.content]
-}
-
-// A white space tokenizer
-fn tokenizer(s: &str) -> Vec<Cow<str>> {
-    s.split(' ').map(Cow::from).collect::<Vec<_>>()
 }
 
 async fn is_visited(url: &str, visited: &Arc<Mutex<HashSet<String>>>) -> bool {
@@ -100,7 +98,7 @@ async fn crawl_worker(
             tracing::info!(url = %url, links = page.hrefs.len(), "crawled page");
 
             let mut index = index.lock().await;
-            index.add_document(&[extract_title, extract_content], tokenizer, page_id, &page);
+            index.add_document(&[extract_title, extract_content], tokenize, page_id, &page);
             drop(index);
 
             for link in page.hrefs {
@@ -220,7 +218,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let index = Index::<usize>::new(2);
 
             // Search through the index
-            let result = index.query(query, &mut bm25::new(), tokenizer, &[1., 1.]);
+            let result = index.query(query, &mut bm25::new(), tokenize, &[1., 1.]);
             println!("Search results:");
             for (i, res) in result.iter().enumerate() {
                 println!("{}. Score: {}", i + 1, res.score);
@@ -259,8 +257,11 @@ async fn fetch_page(
         return Err(format!("HTTP {} for {}", res.status(), uri_display).into());
     }
 
-    // Get the response body and convert to string
-    let body = res.collect().await?.to_bytes();
+    // Enforce the timeout while reading the response body as well as headers.
+    let body = tokio::time::timeout(Duration::from_secs(timeout_secs), res.collect())
+        .await
+        .map_err(|_| format!("response body timed out after {timeout_secs}s"))??
+        .to_bytes();
     Ok(decode_body(&body))
 }
 
