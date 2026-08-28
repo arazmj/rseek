@@ -12,7 +12,7 @@ Default store path:
 - Linux: `$XDG_DATA_HOME/rseek/pages.jsonl`, or `~/.local/share/rseek/pages.jsonl` when `XDG_DATA_HOME` is unset
 - macOS: `~/Library/Application Support/rseek/pages.jsonl`
 
-Requires Rust 1.74+.
+Requires Rust 1.82+.
 
 ## Install
 
