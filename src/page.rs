@@ -15,12 +15,13 @@ impl Page {
         }
     }
 
-    fn parse_links(html: &String) -> Vec<String>{
+    fn parse_links(html: &String) -> Vec<String> {
         // Parse the HTML content
         let document = Html::parse_document(html);
         let selector = Selector::parse("a").unwrap();
 
-        document.select(&selector)
+        document
+            .select(&selector)
             .filter_map(|element| element.value().attr("href").map(|s| s.to_string()))
             .collect()
     }
@@ -39,7 +40,9 @@ impl Page {
     fn parse_title(html: &String) -> Option<String> {
         let document = Html::parse_document(html);
         let selector = Selector::parse("title").unwrap();
-        document.select(&selector).next().map(|element| element.inner_html())
+        document
+            .select(&selector)
+            .next()
+            .map(|element| element.inner_html())
     }
-
 }
