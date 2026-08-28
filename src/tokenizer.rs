@@ -12,7 +12,10 @@ mod tests {
     use super::tokenize;
 
     fn tokens(input: &str) -> Vec<String> {
-        tokenize(input).into_iter().map(|token| token.into_owned()).collect()
+        tokenize(input)
+            .into_iter()
+            .map(|token| token.into_owned())
+            .collect()
     }
 
     #[test]

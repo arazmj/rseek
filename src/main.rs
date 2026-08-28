@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use http_body_util::{BodyExt, Empty};
 use hyper::{Request, Uri};
 use hyper_tls::HttpsConnector;
@@ -8,10 +8,9 @@ use hyper_util::rt::TokioExecutor;
 use page::Page;
 use probly_search::score::bm25;
 use probly_search::Index;
-use scraper::{Html, Selector};
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::error::Error;
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -45,32 +44,40 @@ async fn is_visited(url: &str, visited: &Arc<Mutex<HashSet<String>>>) -> bool {
     }
 }
 
-fn parse_links(html: &str) -> Vec<String> {
-    let document = Html::parse_document(html);
-    let selector = Selector::parse("a[href]").unwrap();
-
-    document
-        .select(&selector)
-        .filter_map(|element| element.value().attr("href"))
-        .filter(|href| href.starts_with("http"))
-        .map(String::from)
-        .collect()
+fn make_absolute_url(base: &str, href: &str) -> Option<String> {
+    Url::parse(base).ok()?.join(href).ok().map(Into::into)
 }
 
-fn make_absolute_url(base: &str, href: &str) -> Option<String> {
-    if href.starts_with("http://") || href.starts_with("https://") {
-        Some(href.to_string())
-    } else if href.starts_with("//") {
-        Some(format!("https:{}", href))
-    } else if href.starts_with('/') {
-        let base_url = Url::parse(base).ok()?;
-        let scheme = base_url.scheme();
-        let host = base_url.host_str()?;
-        Some(format!("{}://{}{}", scheme, host, href))
-    } else {
-        let base_url = Url::parse(base).ok()?;
-        base_url.join(href).ok().map(|u| u.to_string())
+pub fn normalize_url(raw: &str) -> Option<String> {
+    let mut url = Url::parse(raw).ok()?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return None;
     }
+
+    url.set_fragment(None);
+
+    let default_port = match url.scheme() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    if url.port_or_known_default() == default_port && url.port().is_some() {
+        url.set_port(None).ok()?;
+    }
+
+    let mut normalized = url.to_string();
+    if url.path() == "/" && url.query().is_none() {
+        normalized.pop();
+    }
+
+    Some(normalized)
+}
+
+fn is_same_origin(url: &str, seed_origin: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization() == seed_origin)
+        .unwrap_or(false)
 }
 
 #[tracing::instrument(skip(client))]
@@ -91,6 +98,8 @@ async fn crawl_worker(
     tx: mpsc::Sender<String>,
     index: Arc<Mutex<Index<usize>>>,
     page_id: usize,
+    seed_origin: String,
+    allow_cross_origin: bool,
     timeout_secs: u64,
 ) {
     match crawl_url(url.clone(), client, timeout_secs).await {
@@ -103,9 +112,13 @@ async fn crawl_worker(
 
             for link in page.hrefs {
                 if let Some(link) = make_absolute_url(&url, &link) {
-                    tracing::debug!(url = %url, link = %link, "queueing discovered link");
-                    if tx.send(link).await.is_err() {
-                        tracing::warn!(url = %url, "failed to queue discovered link because crawler channel is closed");
+                    if let Some(normalized_link) = normalize_url(&link) {
+                        if allow_cross_origin || is_same_origin(&normalized_link, &seed_origin) {
+                            tracing::debug!(url = %url, link = %normalized_link, "queueing discovered link");
+                            if tx.send(normalized_link).await.is_err() {
+                                tracing::warn!(url = %url, "failed to queue discovered link because crawler channel is closed");
+                            }
+                        }
                     }
                 }
             }
@@ -144,6 +157,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .default_value("10"),
                 )
                 .arg(
+                    Arg::new("allow-cross-origin")
+                        .help("Allow crawling links outside the seed URL origin")
+                        .long("allow-cross-origin")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
                     Arg::new("timeout")
                         .help("Request timeout in seconds")
                         .short('t')
@@ -167,6 +186,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match matches.subcommand() {
         Some(("crawl", sub_matches)) => {
             let url = sub_matches.get_one::<String>("url").unwrap();
+            let normalized_seed = normalize_url(url).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("seed URL must be an absolute HTTP(S) URL: {url}"),
+                )
+            })?;
+            let seed_origin = Url::parse(&normalized_seed)?.origin().ascii_serialization();
+            let allow_cross_origin = sub_matches.get_flag("allow-cross-origin");
             let concurrency = sub_matches
                 .get_one::<String>("concurrency")
                 .unwrap()
@@ -187,7 +214,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut page_count = 0;
 
             // Send the initial URL
-            tx.send(url.clone()).await?;
+            tx.send(normalized_seed).await?;
 
             // Process URLs
             while let Some(url) = rx.recv().await {
@@ -196,20 +223,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let semaphore = semaphore.clone();
                 let client = client.clone();
                 let index = index.clone();
-                let timeout_secs = timeout_secs;
+                let seed_origin = seed_origin.clone();
+
+                let Some(url) = normalize_url(&url) else {
+                    continue;
+                };
 
                 if !is_visited(&url, &visited).await {
                     let permit = semaphore.acquire_owned().await?;
 
                     tokio::spawn(async move {
-                        crawl_worker(url, client, tx, index, page_count, timeout_secs).await;
+                        crawl_worker(
+                            url,
+                            client,
+                            tx,
+                            index,
+                            page_count,
+                            seed_origin,
+                            allow_cross_origin,
+                            timeout_secs,
+                        )
+                        .await;
                         drop(permit);
                     });
                 }
                 page_count += 1;
             }
 
-            println!("Crawling completed. Indexed {} pages.", page_count);
+            tracing::info!("Crawling completed. Indexed {} pages.", page_count);
         }
         Some(("search", sub_matches)) => {
             let query = sub_matches.get_one::<String>("query").unwrap();
@@ -280,5 +321,41 @@ mod tests {
         let decoded = decode_body(&[0xC3, 0x28]);
 
         assert!(decoded.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn normalizes_scheme_host_fragment_default_ports_and_root_path() {
+        assert_eq!(
+            normalize_url("https://Example.COM/Foo#bar"),
+            Some("https://example.com/Foo".to_string())
+        );
+        assert_eq!(
+            normalize_url("http://example.com:80/x"),
+            Some("http://example.com/x".to_string())
+        );
+        assert_eq!(
+            normalize_url("https://example.com:443/y"),
+            Some("https://example.com/y".to_string())
+        );
+        assert_eq!(
+            normalize_url("https://example.com/"),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_urls() {
+        assert_eq!(normalize_url("mailto:foo@bar.com"), None);
+        assert_eq!(normalize_url("javascript:alert(1)"), None);
+        assert_eq!(normalize_url("not a url"), None);
+    }
+
+    #[test]
+    fn same_origin_includes_scheme_and_port() {
+        let origin = "https://example.com";
+
+        assert!(is_same_origin("https://example.com/page", origin));
+        assert!(!is_same_origin("http://example.com/page", origin));
+        assert!(!is_same_origin("https://example.com:8443/page", origin));
     }
 }
