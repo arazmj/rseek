@@ -89,6 +89,21 @@ struct CrawlItem {
     tx: mpsc::Sender<CrawlItem>,
 }
 
+#[derive(Clone)]
+struct CrawlState {
+    index: Arc<Mutex<Index<usize>>>,
+    page_count: Arc<AtomicUsize>,
+    store: Arc<PageStore>,
+}
+
+#[derive(Clone)]
+struct CrawlConfig {
+    max_pages: usize,
+    seed_origin: String,
+    allow_cross_origin: bool,
+    timeout_secs: u64,
+}
+
 fn should_enqueue_links(indexed_pages: usize, max_pages: usize) -> bool {
     indexed_pages < max_pages
 }
@@ -130,7 +145,10 @@ fn is_same_origin(url: &str, seed_origin: &str) -> bool {
 }
 
 fn is_allowed(robot: Option<&Robot>, url: &str) -> bool {
-    robot.map_or(true, |robot| robot.allowed(url))
+    match robot {
+        Some(robot) => robot.allowed(url),
+        None => true,
+    }
 }
 
 #[tracing::instrument(skip(client))]
@@ -233,27 +251,22 @@ async fn crawl_url(
     Ok(Page::new(html))
 }
 
-#[tracing::instrument(skip(client, tx, index, page_count, store))]
+#[tracing::instrument(skip(client, tx, state, config))]
 async fn crawl_worker(
     url: String,
     client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
     tx: mpsc::Sender<CrawlItem>,
-    index: Arc<Mutex<Index<usize>>>,
-    page_count: Arc<AtomicUsize>,
-    store: Arc<PageStore>,
-    max_pages: usize,
-    seed_origin: String,
-    allow_cross_origin: bool,
-    timeout_secs: u64,
+    state: CrawlState,
+    config: CrawlConfig,
 ) {
-    match crawl_url(url.clone(), client, timeout_secs).await {
+    match crawl_url(url.clone(), client, config.timeout_secs).await {
         Ok(page) => {
             tracing::info!(url = %url, links = page.hrefs.len(), "crawled page");
 
             let indexed_pages = {
-                let mut index = index.lock().await;
-                let page_id = page_count.load(Ordering::SeqCst);
-                if !should_enqueue_links(page_id, max_pages) {
+                let mut index = state.index.lock().await;
+                let page_id = state.page_count.load(Ordering::SeqCst);
+                if !should_enqueue_links(page_id, config.max_pages) {
                     return;
                 }
 
@@ -262,23 +275,25 @@ async fn crawl_worker(
                     title: page.title.clone(),
                     content: page.content.clone(),
                 };
-                if let Err(error) = store.append(&stored_page) {
+                if let Err(error) = state.store.append(&stored_page) {
                     tracing::error!(url = %url, error = %error, "failed to store crawled page");
                     return;
                 }
 
                 index.add_document(&[extract_title, extract_content], tokenize, page_id, &page);
-                page_count.fetch_add(1, Ordering::SeqCst) + 1
+                state.page_count.fetch_add(1, Ordering::SeqCst) + 1
             };
 
-            if !should_enqueue_links(indexed_pages, max_pages) {
+            if !should_enqueue_links(indexed_pages, config.max_pages) {
                 return;
             }
 
             for link in page.hrefs {
                 if let Some(link) = make_absolute_url(&url, &link) {
                     if let Some(normalized_link) = normalize_url(&link) {
-                        if allow_cross_origin || is_same_origin(&normalized_link, &seed_origin) {
+                        if config.allow_cross_origin
+                            || is_same_origin(&normalized_link, &config.seed_origin)
+                        {
                             tracing::debug!(url = %url, link = %normalized_link, "queueing discovered link");
                             let item = CrawlItem {
                                 url: normalized_link,
@@ -413,8 +428,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let (tx, mut rx) = mpsc::channel::<CrawlItem>(100);
             let visited = Arc::new(Mutex::new(HashSet::new()));
             let semaphore = Arc::new(Semaphore::new(concurrency));
-            let index = Arc::new(Mutex::new(Index::<usize>::new(2)));
             let page_count = Arc::new(AtomicUsize::new(0));
+            let state = CrawlState {
+                index: Arc::new(Mutex::new(Index::<usize>::new(2))),
+                page_count: page_count.clone(),
+                store,
+            };
+            let config = CrawlConfig {
+                max_pages,
+                seed_origin,
+                allow_cross_origin,
+                timeout_secs,
+            };
             let mut robots_by_origin = HashMap::<String, Option<Robot>>::new();
             let mut workers = JoinSet::new();
             let mut shutdown_requested = false;
@@ -469,10 +494,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                         let semaphore = semaphore.clone();
                         let client = client.clone();
-                        let index = index.clone();
-                        let page_count = page_count.clone();
-                        let store = store.clone();
-                        let seed_origin = seed_origin.clone();
+                        let state = state.clone();
+                        let config = config.clone();
 
                         workers.spawn(async move {
                             let Ok(permit) = semaphore.acquire_owned().await else {
@@ -482,13 +505,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 url,
                                 client,
                                 tx,
-                                index,
-                                page_count,
-                                store,
-                                max_pages,
-                                seed_origin,
-                                allow_cross_origin,
-                                timeout_secs,
+                                state,
+                                config,
                             )
                             .await;
                             drop(permit);
@@ -682,5 +700,56 @@ mod tests {
             "https://example.com/private/public"
         ));
         assert!(is_allowed(None, "https://example.com/private"));
+    }
+
+    #[test]
+    fn extractor_helpers_return_page_fields_for_indexing() {
+        let titled = Page {
+            title: Some("Example Title".to_string()),
+            content: "Example body".to_string(),
+            hrefs: vec![],
+        };
+        let untitled = Page {
+            title: None,
+            content: "Untitled body".to_string(),
+            hrefs: vec![],
+        };
+
+        assert_eq!(extract_title(&titled), vec!["Example Title"]);
+        assert!(extract_title(&untitled).is_empty());
+        assert_eq!(extract_content(&titled), vec!["Example body"]);
+    }
+
+    #[test]
+    fn tokenizer_splits_on_spaces() {
+        let tokens = tokenize("rust search tool")
+            .into_iter()
+            .map(|token| token.into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(tokens, vec!["rust", "search", "tool"]);
+    }
+
+    #[test]
+    fn make_absolute_url_handles_absolute_scheme_relative_root_and_relative_links() {
+        let base = "https://example.com/docs/index.html";
+
+        assert_eq!(
+            make_absolute_url(base, "https://rust-lang.org"),
+            Some("https://rust-lang.org/".to_string())
+        );
+        assert_eq!(
+            make_absolute_url(base, "//cdn.example.com/app.js"),
+            Some("https://cdn.example.com/app.js".to_string())
+        );
+        assert_eq!(
+            make_absolute_url(base, "/about"),
+            Some("https://example.com/about".to_string())
+        );
+        assert_eq!(
+            make_absolute_url(base, "guide/start.html"),
+            Some("https://example.com/docs/guide/start.html".to_string())
+        );
+        assert_eq!(make_absolute_url("not a url", "/about"), None);
     }
 }
