@@ -9,18 +9,22 @@ use page::Page;
 use probly_search::score::bm25;
 use probly_search::Index;
 use std::collections::HashSet;
+use std::env;
 use std::error::Error;
 use std::io;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
+use store::{PageStore, StoredPage};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
 mod page;
+mod store;
 mod tokenizer;
 
 use tokenizer::tokenize;
@@ -35,6 +39,30 @@ fn extract_title(p: &Page) -> Vec<&str> {
 
 fn extract_content(p: &Page) -> Vec<&str> {
     vec![&p.content]
+}
+
+fn extract_stored_title(p: &StoredPage) -> Vec<&str> {
+    p.title.as_deref().into_iter().collect()
+}
+
+fn extract_stored_content(p: &StoredPage) -> Vec<&str> {
+    vec![&p.content]
+}
+
+fn default_store_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join("rseek")
+        .join("pages.jsonl")
+}
+
+fn store_arg() -> Arg {
+    Arg::new("store")
+        .help("Path to the JSONL page store")
+        .short('s')
+        .long("store")
+        .value_name("PATH")
+        .value_parser(clap::value_parser!(PathBuf))
 }
 
 async fn is_visited(url: &str, visited: &Arc<Mutex<HashSet<String>>>) -> bool {
@@ -103,13 +131,14 @@ async fn crawl_url(
     Ok(Page::new(html))
 }
 
-#[tracing::instrument(skip(client, tx, index, page_count))]
+#[tracing::instrument(skip(client, tx, index, page_count, store))]
 async fn crawl_worker(
     url: String,
     client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
     tx: mpsc::Sender<CrawlItem>,
     index: Arc<Mutex<Index<usize>>>,
     page_count: Arc<AtomicUsize>,
+    store: Arc<PageStore>,
     max_pages: usize,
     seed_origin: String,
     allow_cross_origin: bool,
@@ -123,6 +152,16 @@ async fn crawl_worker(
                 let mut index = index.lock().await;
                 let page_id = page_count.load(Ordering::SeqCst);
                 if !should_enqueue_links(page_id, max_pages) {
+                    return;
+                }
+
+                let stored_page = StoredPage {
+                    url: url.clone(),
+                    title: page.title.clone(),
+                    content: page.content.clone(),
+                };
+                if let Err(error) = store.append(&stored_page) {
+                    tracing::error!(url = %url, error = %error, "failed to store crawled page");
                     return;
                 }
 
@@ -205,7 +244,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .long("timeout")
                         .default_value("10")
                         .value_parser(clap::value_parser!(u64)),
-                ),
+                )
+                .arg(store_arg()),
         )
         .subcommand(
             Command::new("search")
@@ -215,7 +255,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .help("The search query")
                         .required(true)
                         .index(1),
-                ),
+                )
+                .arg(store_arg()),
         )
         .get_matches();
 
@@ -247,6 +288,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .copied()
                 .unwrap_or(100);
             let timeout_secs = sub_matches.get_one::<u64>("timeout").copied().unwrap_or(10);
+            let store_path = sub_matches
+                .get_one::<PathBuf>("store")
+                .cloned()
+                .unwrap_or_else(default_store_path);
+            let store = Arc::new(PageStore::open(store_path.clone())?);
+            tracing::info!(path = ?store_path, "storing crawled pages");
 
             // Create a new HTTP client with HTTPS support
             let https = HttpsConnector::new();
@@ -282,6 +329,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let client = client.clone();
                 let index = index.clone();
                 let page_count = page_count.clone();
+                let store = store.clone();
                 let seed_origin = seed_origin.clone();
 
                 tokio::spawn(async move {
@@ -294,6 +342,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         tx,
                         index,
                         page_count,
+                        store,
                         max_pages,
                         seed_origin,
                         allow_cross_origin,
@@ -311,15 +360,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(("search", sub_matches)) => {
             let query = sub_matches.get_one::<String>("query").unwrap();
+            let store_path = sub_matches
+                .get_one::<PathBuf>("store")
+                .cloned()
+                .unwrap_or_else(default_store_path);
+            let pages = PageStore::read_all(&store_path)?;
+            let mut index = Index::<usize>::new(2);
 
-            // TODO: Load the index
-            let index = Index::<usize>::new(2);
+            for (id, page) in pages.iter().enumerate() {
+                index.add_document(
+                    &[extract_stored_title, extract_stored_content],
+                    tokenize,
+                    id,
+                    page,
+                );
+            }
 
-            // Search through the index
             let result = index.query(query, &mut bm25::new(), tokenize, &[1., 1.]);
-            println!("Search results:");
+            tracing::info!(path = ?store_path, results = result.len(), "searching stored pages");
             for (i, res) in result.iter().enumerate() {
-                println!("{}. Score: {}", i + 1, res.score);
+                if let Some(page) = pages.get(res.key) {
+                    tracing::info!(
+                        position = i + 1,
+                        url = %page.url,
+                        title = page.title.as_deref().unwrap_or("<untitled>"),
+                        score = res.score,
+                        "search result"
+                    );
+                }
             }
         }
         _ => unreachable!(),
